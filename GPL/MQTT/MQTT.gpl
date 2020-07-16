@@ -1,0 +1,1109 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+
+Public Class MqttClient	
+	#Region Constants
+	Private Const EVENT_TERMINATE As Integer = &H04
+	#End Region 
+	#Region Static
+	''
+	'' access to individual instances from global static thread methods
+	Private Shared _instances(10) As MqttClient	
+	#End Region 
+	#Region Fields
+	Private _log As MQTTLogger
+	''
+	'' lock variables - used to serialize access to the socket 
+	Private _socket_lock As Integer = 0	
+	Private _remote_endpoint As IPEndPoint = Nothing
+	Private _client_id As String = Nothing
+	Private _user_name As String = Nothing
+	Private _password As String = Nothing
+	Private _keepalive_period As Integer = 30
+	Private _is_connected As Boolean = False
+	Private _packets_received As Double 
+	Private _packets_published As Double
+	Private _error_code As Integer = 0
+	Private _error_msg As String = ""
+	Private _clean_session As Boolean = False
+	Private _client As TcpClient
+	Private _owning_thread As Thread
+	Private _receiver_thread As Thread
+	Private _keepalive_thread As Thread
+	Private _connection_status As MqttConnectionStatus
+	Private _last_ping_time As Double = 0.0
+	Private _last_ping_response As Double
+	Private _last_packet_out_time As Double = Controller.Timer
+
+	Private _last_will As String
+	Private _last_will_topic As String
+	Private _last_will_qos As Integer = 0
+	Private _last_will_retain As Boolean = True
+	
+	Private _publish_queue As MQTTMessageQueue
+	#End Region
+	#Region Properties
+	
+	Public ReadOnly Property RemoteEndPoint As IPEndPoint
+		Get
+			Return _remote_endpoint
+		End Get
+	End Property
+	Public ReadOnly Property ClientID As String
+		Get 
+			Return _client_id
+		End Get
+	End Property
+	Public Property UserName As String 
+		Get 
+			Return _user_name
+		End Get
+		Set ( value As String )
+			_user_name = value
+		End Set
+	End Property 
+	Public Property Password As String 
+		Get 
+			Return _password
+		End Get
+		Set ( value As String )
+			_password = value
+		End Set
+	End Property 		
+	''
+	'' MQTT Keep Alive period - SECONDS
+	Public Property KeepAlive As Integer 
+		Get 
+			Return _keepalive_period
+		End Get
+		Set ( value As Integer )
+			If value < MQTT_KEEPALIVE_MIN Then 
+				_keepalive_period = MQTT_KEEPALIVE_MIN
+			ElseIf MQTT_KEEPALIVE_MAX < value Then 
+				_keepalive_period = MQTT_KEEPALIVE_MAX
+			Else 
+				_keepalive_period = value
+			End If 
+		End Set
+	End Property
+	Public ReadOnly Property IsConnected As Boolean
+		Get
+			Return _is_connected
+		End Get
+	End Property
+	Public ReadOnly Property IsError()As Boolean
+		Get 
+			Return _error_code <> 0
+		End Get
+	End Property 
+	Public ReadOnly Property ErrorCode As Integer 
+		Get
+			Return _error_code
+		End Get
+	End Property 
+	Public ReadOnly Property ErrorMessage As String
+		Get
+			Return _error_msg
+		End Get
+	End Property 
+	Public ReadOnly Property CleanSession As Boolean
+		Get
+			Return _clean_session
+		End Get
+	End Property
+	Public ReadOnly Property ConnectStatus As MqttConnectionStatus
+		Get 
+			Return _connection_status 
+		End Get
+	End Property 
+	Public Property LastWill As String
+		Get
+			Return _last_will
+		End Get
+		Set ( value As String )
+			_last_will = value 
+		End Set
+	End Property
+	Public Property LastWillTopic As String
+		Get 
+			Return _last_will_topic 
+		End Get
+		Set ( value As String )
+			_last_will_topic = value
+		End Set
+	End Property 
+	Public Property LastWillRetain As Boolean 
+		Get
+			Return _last_will_retain 
+		End Get
+		Set ( value As Boolean )
+			_last_will_retain = value
+		End Set
+	End Property 
+	Public Property LastWillQOS As Integer 
+		Get
+			Return _last_will_qos
+		End Get
+		Set ( value As Integer )
+			_last_will_qos = value And &H03
+		End Set
+	End Property 
+	Public ReadOnly Property MessagesReceived As Double
+		Get
+			Return _packets_received
+		End Get
+	End Property 
+	Public ReadOnly Property MessagesPublished As Double
+		Get
+			Return _packets_published
+		End Get
+	End Property
+	Public ReadOnly Property PublishQueueCount As Integer
+		Get
+			Return _publish_queue.Count
+		End Get
+	End Property 
+	Public ReadOnly Property PublishQueueMaxCount As Integer
+		Get
+			Return _publish_queue.MaxCount
+		End Get
+	End Property 
+	Public Property LogLevel As Integer
+		Get
+			Return _log.LogLevel 
+		End Get
+		Set ( value As Integer )
+			_log.LogLevel = value
+		End Set
+	End Property 
+
+	#End Region 
+	#Region Events
+	''
+	'' delegate used for connection related callbacks
+	Public Delegate Sub MqttErrorDelegate( mqtt As MqttClient, errCode As Integer, errMsg As String )		
+	Public Delegate Sub MqttConnectionDelegate( mqtt As MqttClient )		
+	Public Delegate Sub MqttMessagePublishedDelegate( msg As MQTTMessage )		
+	Public Delegate Sub MqttMessageReceivedDelegate( msg As MQTTMessage )		
+	 
+	Public OnError 				As MqttErrorDelegate
+	''
+	'' invoked on receipt of successful CONNACK from server - indicates 
+	'' connection is successful 
+	Public OnConnected 			As MqttConnectionDelegate
+	''
+	'' invoked on receipt of failed CONNACK or if server closes socket 
+	'' before issuing CONNACK
+	Public OnConnectFailed 		As MqttConnectionDelegate
+	''
+	'' invoked when disconnected (only when a successful connection was established)
+	Public OnDisconnected 		As MqttConnectionDelegate		
+	''
+	'' invoked when message is successfully published
+	Public OnPublished			As MqttMessagePublishedDelegate
+	''
+	'' invoked when published message arrives
+	Public OnMessageReceived	As MqttMessageReceivedDelegate
+	
+	
+	Private Sub RaiseError( errCode As Integer, errMsg As String )
+		Dim exc As Exception		
+		_error_code = errCode
+		_error_msg = errMsg
+		_log.Err( "raising error:" & CStr( errCode ) & ":" & errMsg & " " & Thread.CurrentThread.Name  )
+		If OnError Is Nothing Then Return 
+		Try 
+			OnError( Me, errCode, errMsg )
+		Catch exc 
+			_log.Except( exc, "OnError delegate failed:"  )
+		End Try 
+	End Sub	
+	Private Sub RaiseConnected()
+		Dim exc As Exception
+		If OnConnected Is Nothing Then Return 
+		Try 
+			OnConnected( Me )
+		Catch exc 
+			_log.Except( exc, "OnConnected delegate failed" )
+		End Try
+	End Sub
+	Private Sub RaiseConnectFailed()
+		Dim exc As Exception
+		If OnConnectFailed Is Nothing Then Return 
+		Try 
+			OnConnectFailed( Me )
+		Catch exc 
+			_log.Except( exc, "OnConnectfailed delegate failed" )
+		End Try
+	End Sub
+	Private Sub RaiseDisconnected()
+		Dim exc As Exception
+		If OnDisconnected Is Nothing Then Return 
+		Try 
+			OnDisconnected( Me )
+		Catch exc 
+			_log.Except( exc, "OnDisconnected delegate failed" )
+		End Try
+	End Sub
+	Private Sub RaisePublished( msg As MQTTMessage )
+		Dim exc As Exception
+		If OnPublished Is Nothing Then Return 
+		Try 
+			OnPublished( msg )
+		Catch exc 
+			_log.Except( exc, "OnPublished delegate failed" )
+		End Try
+	End Sub	
+	Private Sub RaiseMessageReceived( msg As MQTTMessage )
+		Dim exc As Exception
+		If OnMessageReceived Is Nothing Then Return 
+		Try 
+			OnMessageReceived( msg )
+		Catch exc 
+			_log.Except( exc, "OnMessageReceived delegate failed" )
+		End Try
+	End Sub
+	#End Region
+	#Region Initialization
+	Public Sub New( remote As IPEndPoint, client_id As String )
+		Initialize()
+		_remote_endpoint = remote
+		_client_id = client_id		
+	End Sub
+	Public Sub New( remote As IPEndPoint, client_id As String, will_topic As String, will As String, will_retain As Boolean, will_qos As Integer )
+		Initialize()
+		_remote_endpoint = remote
+		_client_id = client_id					
+		_last_will = will
+		_last_will_topic = will_topic
+		_last_will_retain = will_retain
+		_last_will_qos = will_qos And &H03
+	End Sub
+	Private Sub Initialize()
+		_instances( 0 ) = Me
+		_log = New MQTTLogger()
+		_publish_queue = New MQTTMessageQueue()
+	End Sub
+	
+	
+	#End Region 
+	#Region Error Handling
+	''
+	'' Generates a 'MQTT' exception
+	'' ErrorCode = MQTT_EXCEPTION_CODE
+	'' Qualifier = error code
+	'' Example Usage:
+	''   Throw GenException( MQTT_ERR_UNSUPPORTED_PACKET, "received unsupported packet - type:" & CStr( ptype ) )
+	Public Function GenException( errCode As Integer, msg As String ) As Exception
+		Dim exc As New Exception
+		_log.Err( msg )
+		exc.RobotError = False
+		exc.ErrorCode  = MQTT_EXCEPTION_CODE
+		exc.Qualifier = errCode
+		Return exc
+	End Function
+	#End Region 
+	#Region Public Interface
+	Public Sub Connect		
+		Dim exc As Exception
+		
+		_log.Info( "begin connect  " & _remote_endpoint.IPAddress & ":" & CStr( _remote_endpoint.Port ) )
+		
+		InitializeSocketLock()
+		_owning_thread = Thread.CurrentThread	'' only owner can disconnect
+		_client = New TcpClient()
+		Try 
+			_client.Client.Connect( _remote_endpoint )
+		Catch exc 
+			Throw GenException( MQTT_ERR_CONN_REFUSED, exc.Message )
+		End Try 
+		
+		_client.Client.KeepAlive = True			'' 32 second timeout when server lost
+		_client.Client.Blocking = True			'' Receiver relies on this
+		_client.Client.ReceiveTimeout = 0		'' No timeout
+		_client.Client.SendTimeout = 0			'' No timeout
+		
+		_receiver_thread = New Thread( "MqttClient.AsyncReceiver" )
+		_receiver_thread.Argument = 0
+		_receiver_thread.Start()
+		
+		_keepalive_thread = New Thread( "MqttClient.AsyncPublish" )
+		_keepalive_thread.Argument = 0
+		_keepalive_thread.Start()		
+		
+		_is_connected = True
+		
+		SendPacket( EncodeConnect() )
+		_log.Info( "socket connected - protocol connect pending" )
+	End Sub
+	Public Sub Disconnect
+		Dim exc As Exception
+		
+		_log.Debug( "begin disconnect" )
+		
+		'' tried many ways of comparing thread objects and comparing names seems to 
+		'' be the only way....
+		If _owning_thread.Name <> Thread.CurrentThread.Name Then 
+			_log.err( "attempt to disconnect on non-owner thread" )
+			Return
+		End If
+		_is_connected = False
+		''
+		'' send disconnect to server - protocol spec says we _cannot_ send any more 
+		'' control packets, so immediately close the socket (server is dong the same)
+		'' - receiver thread will fault and terminate as soon as the socket is closed 
+		Try 
+			SendPacket( EncodeDisconnect() )
+		Catch exc
+			_log.Except( exc, "disconnect control packet failed" )
+		End Try 
+		''
+		'' kill the keep alive thread - just brute force it
+		If Not _keepalive_thread Is Nothing Then
+			_keepalive_thread.SendEvent( EVENT_TERMINATE )
+			If Not _keepalive_thread.Join( 500 ) Then 
+				_log.Debug( "async publish thread failed to join - aborting" )
+			End If
+			_keepalive_thread.Abort()		
+			_keepalive_thread = Nothing
+		Else 
+			_log.Warn( "disconnect - keep alive thread is null" )
+		End If
+		''
+		'' close the socket
+		'' receiver thread should awake in response and terminate due to closed socket
+		Try 
+			_client.Close()		
+		Catch exc 
+			_log.Except( exc, "diconnecting - close socket failed" )
+		End Try 
+		''
+		'' wait for receiver thread to terminate gracefully 
+		'' (Abort is the only (??) way to cleanup the thread's resources)
+		If Not _receiver_thread Is Nothing Then 
+			If Not _receiver_thread.Join( 5000 ) Then 
+				_log.Debug( "receiver thread failed to join - aborting" )
+			End If
+			_receiver_thread.Abort
+			_receiver_thread = Nothing
+		Else 
+			_log.warn( "disconnect - receiver thread is null" )
+		End If 
+		RaiseDisconnected()
+		_log.Debug( "completed disconnect" )
+	End Sub 
+	''
+	'' Publish a message
+	'' INPUT 		topic			topic to publish to 
+	''				payload			message body
+	''				retain			set/clear message retain flag
+	''				qos				Quality Of Service
+	''				
+	Public Sub Publish( topic As String, payload As String, retain As Boolean, qos As Integer )
+		Dim msg As New MqttMessage( topic, payload, retain , qos )
+		SendPacket( EncodePublish( msg ) )
+		RaisePublished( msg )
+	End Sub
+	Public Sub PublishAsync( topic As String, payload As String, retain As Boolean, qos As Integer )
+'		Publish( topic, payload, retain, qos )
+		_publish_queue.Enqueue( New MqttMessage( topic, payload, retain , qos ) )
+	End Sub
+	Public Sub Subscribe( topics() As String, qos() As Integer )
+		SendPacket( EncodeSubscribe( topics, qos ) )
+	End Sub	
+	Public Sub Unsubscribe( topics() As String )
+		SendPacket( EncodeUnsubscribe( topics ) )
+	End Sub	
+	Public Function SetLogLevel( level As Integer ) As Integer 
+		Dim oldLevel As Integer = _log.LogLevel
+		_log.LogLevel = level And MQTT_LOG_LEVEL_ALL  '' ensure leagal mask
+		Return oldLevel
+	End Function
+	#End Region
+	#Region AsyncPublish  
+	''
+	'' = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+	''
+	'' Keep Alive Thread
+	'' awakens periodically to determine if a PING packet needs to be sent to the server.
+	'' 1) if the last packet was transmitted more than the keep alive period in the past then a 
+	'' 		PING packet is sent to the server
+	'' 2) if a PING response is pending and the keep alive period is expired then a timeout error 
+	''		is raised which 
+	''			- disconnects this client
+	''			- raises ugly errors
+	Public Shared Sub AsyncPublish
+		Dim msg As MQTTMessage
+		Dim exc As Exception 
+		Dim omask As Integer
+		Dim this As MqttClient
+		Dim period As Double
+		
+		this = _instances( Thread.CurrentThread.Argument )				
+		''
+		'' actual KeepAlive period is 3/4 of specified period
+		period = ( this.KeepAlive - ( this.KeepAlive / 4 ) ) * 1000.0
+		period = 500
+
+		this._log.Info( Thread.CurrentThread.name & " started  keepalive:" & CStr( this.KeepAlive ) & "s" )
+				
+		While True			
+			Try 
+				msg = this._publish_queue.Dequeue( EVENT_TERMINATE, period, omask ) 
+				If Not msg Is Nothing Then 
+					this.SendPacket( this.EncodePublish( msg ) )
+					this.RaisePublished( msg )
+					this._packets_published += 1
+				Else 
+					If omask = 0 Then 
+						this.DoKeepAlive()
+					ElseIf omask = EVENT_TERMINATE Then 
+						this._log.Debug( Thread.CurrentThread.Name & ": received terminate event" )
+						Exit While
+					Else 
+						this._log.Warn( "MQTT async processing - received unknown event mask:&H" & Hex( omask ) )
+					End If
+				End If 			
+			Catch exc 
+				If exc.ErrorCode = MQTT_EXCEPTION_CODE Then 
+					this.RaiseError( exc.Qualifier, "asyncpub:error:" & MQTTErrors( exc.Qualifier ) ) 
+				Else 
+					this.RaiseError( MQTT_ERR_UNKNOWN_ERROR, "asyncpub:unknown error:" & CStr( exc.ErrorCode ) & ":" & exc.Message )
+				End If
+				Exit While
+			End Try
+		End While
+		this._log.Info( Thread.CurrentThread.Name & ": terminated" )
+	End Sub
+	
+	Private Sub DoKeepAlive()
+		Dim exc As Exception
+		
+		_log.Trace( "DoKeepAlive - last ping time:" & CStr( _last_ping_time  ) )
+		
+		''
+		'' when last_ping_time is > 0 a pending ping has been sent
+		'' receipt of a ping response sets _last_ping_response to 'now' (in Receiver thread)
+		'' so if _last_ping_response > last_ping_time then we know a response was received and 
+		''   we can clear last_ping_time to indicate there are no pending responses
+		'' otherwise check for a timeout
+		If _last_ping_time > 0 Then 
+			If _last_ping_response >= _last_ping_time Then 
+				_last_ping_time = 0
+			ElseIf Controller.Timer > ( _last_ping_response + KeepAlive ) Then 
+				_log.Err( "ping response is late - server is lost" )
+				RaiseError( MQTT_ERR_SERVER_LOST, "keepalive:server lost, ping response is late" )
+			End If 
+		End If
+		''
+		'' if we haven't transmitted a packet in the last KeepAlive seconds, then 
+		'' emit a ping packet - SendPacket() updates _last_packet_out_time
+		If _last_packet_out_time < Controller.Timer - ( KeepAlive / 2.0 ) Then 
+			_last_ping_time = Controller.Timer		'' capture 'now' to timeout server response
+			SendPacket( EncodePingReq )
+		End If	
+	End Sub
+	
+	#End Region
+	#Region AsyncReceiver
+	''
+	'' = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+	''
+	'' Receiver Thread
+	'' Blocking socket receiver 
+	'' - reads packets
+	''   - passes to dispatcher
+	'' - detects EOF which terminates thread (normal exit)
+	'' - catches errors 
+	''   - reports error 
+	''   - terminates thread
+	Public Shared Sub AsyncReceiver
+		Dim exc As Exception
+		Dim this As MqttClient
+		Dim sock As Socket
+		Dim buff As String	
+		Dim rcv_count As Integer
+		
+		this = _instances( Thread.CurrentThread.Argument )
+		this._log.Info( Thread.CurrentThread.name & " started - clientID:" & this.ClientID )
+		
+		sock = this._client.Client
+		
+		Try 
+			While True
+				rcv_count = sock.Receive( buff, MQTT_RECEIVE_BUFF_SIZE )
+				If rcv_count  <= 0 Then 	'' EOF
+					'' if we're disconnecting then is_connected is False and the socket was closed on this side
+					'' otherwise server closed the socket 
+					If this._is_connected Then 
+						this._log.Debug( "receiver: socket closed by remote" )
+						this.RaiseError( MQTT_ERR_SERVER_CLOSED_CONNECTION, "server closed connection" )
+					End If 
+					Exit While
+				End If 
+				this.DispatchPacket( rcv_count, buff )
+				buff = ""
+				this._packets_received += 1
+			End While 		
+			this._log.Debug( "receiver socket closed:" & this.ClientID )
+		Catch exc
+			Select exc.ErrorCode 
+				Case -520 
+					this._log.Info( "receiver stopped - socket closed" )
+				Case Else
+					this._log.Except( exc, "receiver fault" )
+					this.RaiseError( MQTT_ERR_SOCKET_ERROR, "receiver:unexpected socket error:" & exc.Message )
+			End Select 
+		End Try 				
+		this._log.Info( Thread.CurrentThread.Name & ": terminated" )
+	End Sub	
+	''
+	'' = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+	''
+	'' Packet Dispatcher
+	'' Decodes the packet fixed header and then invokes the appropriate handler for that packet type
+	'' Unrecognized packets issue an error messge but are otherwise ignored	
+	Private Sub DispatchPacket( buff_len As Integer, buff As String ) 
+		Dim exc As Exception
+		Dim ptype As Integer 
+		Dim retCode As Integer 
+		
+		ptype = DecodePacketType( buff )
+		Select ptype	
+			Case MQTT_PACKET_ID_CONNACK
+				retCode = DecodeConnAck( buff )
+				If retCode = MQTT_CONN_ACCEPTED Then 
+					_log.Info( Thread.CurrentThread.Name &  ":protocol connected" )
+					RaiseConnected()
+				Else 
+					_log.info( Thread.CurrentThread.Name &  ":connect failed:ret=" & CStr( retCode ) )
+					RaiseConnectFailed()
+				End If
+				
+			Case MQTT_PACKET_ID_PINGREQ
+				SendPacket( EncodePingResp() )
+				
+			Case MQTT_PACKET_ID_PINGRESP
+				_last_ping_response = Controller.Timer
+				
+			Case MQTT_PACKET_ID_PUBLISH
+				RaiseMessageReceived( DecodePublish( buff ) )
+				
+			Case MQTT_PACKET_ID_SUBACK
+				retCode = DecodeSubAck( buff )
+				
+			Case MQTT_PACKET_ID_UNSUBACK 
+				retCode = DecodeUnsubAck( buff )
+			
+			Case Else 
+				Throw GenException( MQTT_ERR_UNSUPPORTED_PACKET, "received unsupported packet - type:" & CStr( ptype ) )
+		End Select	
+	End Sub
+	#End Region
+	#Region Connect
+	''
+	'' builds a CONNECT packet using current property values
+	Public Function EncodeConnect As String
+		Dim fixedHeader 	As String = ""
+		Dim packet 			As String = ""
+		Dim flags 			As Integer = 0
+		''
+		'' variable length header
+		packet = ToBitString( 4, Short, True )	'' protocol header - 4 byte string
+		packet &= "MQTT"
+		packet &= ToBitString( 4, Byte, True )	'' protocol level - 4 == 3.1.1		
+		
+		''
+		'' set flags
+		''
+		
+		'' clean session - always true
+		flags = flags Or MQTT_FLAG_REQ_CLEAN_SESSION
+		''
+		'' will flags
+		If Not _last_will_topic Is Nothing And Not _last_will Is Nothing Then 
+			flags = flags Or MQTT_FLAG_LASTWILL_PRESENT 							'' has a last will
+			flags = flags Or ( _last_will_qos And MQTT_QOS_MASK  ) << 3				'' last will QOS (0,1,2)
+			If _last_will_retain Then flags = flags Or MQTT_FLAG_LASTWILL_RETAIN	'' retain flag
+		End If
+		'' user/password flags
+		If Not _user_name Is Nothing And Not _password Is Nothing Then 
+			flags = flags Or MQTT_FLAG_PASSWORD_PRESENT 
+			flags = flags Or MQTT_FLAG_USERNAME_PRESENT 
+		End If 
+		packet &= ToBitString( flags, Byte, True )	'' connect flags
+		packet &= ToBitString( KeepAlive, Short, True ) '' keep alive 
+		
+		''
+		'' payload - must be in following order:
+		'' - client id
+		'' - will topic			
+		'' - will payload		
+		'' - user name 			
+		'' - password			
+		
+		'' client id
+		packet &= EncodeString( ClientId )
+		'' will 
+		If flags And MQTT_FLAG_LASTWILL_PRESENT Then 
+			packet &= EncodeString( _last_will_topic )
+			packet &= EncodeString( _last_will )
+		End If 
+		'' user name & password
+		If flags And MQTT_FLAG_USERNAME_PRESENT Then 
+			packet &= EncodeString( _user_name )
+			packet &= EncodeString( _password )
+		End If
+		''
+		'' now we know the length of the variable header and the payload
+		'' generate and prepend the fixed header
+		fixedHeader = ToBitString( MQTT_PACKET_ID_CONNECT << 4, Byte, True )
+		fixedHeader &= EncodeRemainingLength( Len( packet ) )		
+		packet = fixedHeader & packet					
+		''
+		'' packet fully assembled
+		Return packet								
+	End Function
+	
+	Public Function EncodeDisconnect As String 
+		Dim packet As String = ""
+		
+		packet &= ToBitString( MQTT_PACKET_ID_DISCONNECT << 4, Byte, True )
+		packet &= EncodeRemainingLength( 0 )
+		Return packet		
+	End Function
+
+	
+	''
+	'' decodes a CONNACK packet
+	Public Function DecodeConnAck( packet As String ) As Integer
+		Dim exc As Exception					
+		Dim remainingLength As Integer 
+		Dim flags As Integer
+		Dim returnCode As Integer
+		Dim offset As Integer = 1
+		
+		remainingLength = DecodeRemainingLength( packet, offset )
+		If remainingLength <> 2 Then 
+			Throw GenException( MQTT_ERR_MALFORMED_CONNACK, "malformed CONNACK - bad length" )
+		End If
+		''
+		'' extract flags
+		'' &H01		-	session restored by server
+		flags = FromBitString( packet.Substring( 2, 1 ), Byte, True )
+		_clean_session = ( flags And MQTT_FLAG_SESSION_PRESENT ) = 0		
+		returnCode = FromBitString( packet.Substring( 3, 1 ), Byte, True )		
+		_connection_status = New MqttConnectionStatus( returnCode )
+		Return returnCode
+	End Function 	
+	#End Region
+	#Region Ping
+	Public Function EncodePingReq As String
+		Dim packet As String = ""
+		packet &= ToBitString( MQTT_PACKET_ID_PINGREQ << 4, Byte, True )
+		packet &= EncodeRemainingLength( 0 )
+		Return packet		
+	End Function
+	
+	Public Function EncodePingResp As String
+		Dim packet As String = ""
+		packet &= ToBitString( MQTT_PACKET_ID_PINGRESP << 4, Byte, True )
+		packet &= EncodeRemainingLength( 0 )
+		Return packet		
+	End Function
+	
+	Public Function DecodePingReq( packet As String ) As Integer 
+		Return 0
+	End Function 
+	
+	Public Function DecodePingResp( packet As String ) As Integer 
+		Return 0
+	End Function 
+	#End Region
+	#Region Publish
+	'' Encode a PUBLISH message from supplied MQTTMessage 
+	Private Function EncodePublish( msg As MQTTMessage ) As String
+		Dim flags As Byte = 0
+		Dim fixedHeader As String = ""
+		Dim packet As String = ""
+		''
+		If msg.QOS <> MQTT_QOS_AT_MOST_ONCE Then Throw GenException( MQTT_ERR_UNSUPPORTED_QOS, "QoS1/2 not supported" )
+		
+		'' variable header 
+		'' - topic 
+		'' - packet id - IF QOS is not AT MOST ONCE		
+		packet &= EncodeString( msg.Topic )		
+		If msg.QOS <> MQTT_QOS_AT_MOST_ONCE Then packet &= ToBitString( msg.Identifier, Short, True )
+		'' payload		
+		packet &= msg.Payload		
+		'' header/payload complete
+		'' prepend fixed header
+		''		
+		flags = MQTT_PACKET_ID_PUBLISH << 4
+		If msg.Retain Then 				flags = flags Or &H01
+		If msg.QOS <> 0 Then 			flags = flags Or ( msg.QOS And &H03 ) << 1
+		If msg.Duplicate Then 			flags = flags Or &H08
+				
+		fixedHeader = ToBitString( flags, Byte, True )
+		fixedHeader &= EncodeRemainingLength( Len( packet ) )		
+		
+		packet = fixedHeader & packet 
+		
+		''=============================================================================
+		'' test code 
+		'' decode the just encoded packet and verify the payloads are identical
+		'''''		Dim msg1 As MQTTMessage
+		'''''		msg1 = DecodePublish( packet )
+		'''''		If msg.Payload = msg1.Payload Then
+		'''''			Console.WriteLine( "decode - ok" )
+		'''''		Else 
+		'''''			Dim exc As New Exception
+		'''''			exc.ErrorCode = -2700
+		'''''			Console.WriteLine( "decode failed" )
+		'''''			Throw exc
+		'''''		End If
+		''=============================================================================
+		
+		Return packet
+	End Function
+	
+	'' Decode a packet to a MQTTMessage 
+	Private Function DecodePublish( packet As String ) As MQTTMessage
+		Dim exc As Exception 
+		Dim msg As New MQTTMessage
+		Dim flags As Byte
+		Dim offset As Integer = 0
+		Dim remaining As Integer
+		Dim variable_hdr_len As Integer = 0
+		Dim payload As String
+				
+		Try 
+			offset = 0
+			flags = FromBitString( packet.Substring( offset, 1 ), Byte, True )		
+			offset += 1	
+			msg.Retain 		= ( flags And &H01 ) = &H01
+			msg.QOS 		= ( flags And &H06 ) >> 1
+			msg.Duplicate 	= ( flags And &H08 ) = &H08
+			'' DecodeRemainingLength advances 'offset' for each byte consumed
+			'' so offset is correct on return
+			remaining = DecodeRemainingLength( packet, offset )				
+			''
+			'' get topic string - advances offset		
+			msg.Topic = DecodeString( packet, offset )
+			variable_hdr_len = Len( msg.Topic )
+			''
+			'' QOS field is optional
+			If msg.QOS <> MQTT_QOS_AT_MOST_ONCE Then 
+				msg.Identifier = FromBitString( packet.Substring( offset, 2 ), Short, True )
+				variable_hdr_len += 2
+				offset += 2
+			End If
+			''
+			'' OFFSET is point at the beginning of the payload
+			'' the LENGTH of the payload is the 'remaining length' minus the variable header
+			'' which is compsed of the topic and (possibly) the packet identifier
+			'' at this time I cannot account for the 2 bytes....
+			msg.Payload = packet.Substring( offset, remaining - variable_hdr_len )		
+			Return msg
+		Catch exc
+			Throw GenException( MQTT_ERR_MALFORMED_PUBLISH , "malformed PUBLISH packet:" & exc.Message )
+		End Try
+	End Function
+	#End Region
+	#Region Subscribe
+	Private Function EncodeSubscribe( topics() As String, qos() As Integer ) As String
+		Dim flags As Byte = 0
+		Dim fixedHeader As String = ""
+		Dim packet As String = ""
+		Dim i As Integer
+		
+		flags = ( MQTT_PACKET_ID_SUBSCRIBE << 4 ) Or &H02		'' bit 1 MUST be set
+		''
+		'' packet identifier
+		packet = ToBitString( Rnd() * 1000, Short, True )
+		
+		For i = 0 To topics.length - 1 
+			packet &= EncodeString( topics( i ) )			' topic
+			If qos( i ) <> MQTT_QOS_AT_MOST_ONCE Then Throw GenException( MQTT_ERR_UNSUPPORTED_QOS, "QoS1/2 not supported" )
+			packet &= ToBitString( qos( i ), Byte, True )	' requested QOS
+		Next i
+		packet &= ToBitString( MQTT_QOS_AT_MOST_ONCE, Byte, True ) ' QOS for this message
+		
+		fixedHeader = ToBitString( flags, Byte, True )
+		fixedHeader &= EncodeRemainingLength( Len( packet ) )
+		
+		packet = fixedHeader & packet
+		Return packet		
+	End Function
+	
+	Private Function DecodeSubAck( packet As String ) As Integer
+		Dim exc As Exception
+		Dim remainingLength As Integer
+		Dim packetId As Integer
+		Dim returnCode As Integer
+		Dim offset As Integer
+		Dim i As Integer 
+		
+		offset = 1
+		remainingLength = DecodeRemainingLength( packet, offset )
+		packetId = FromBitString( packet.Substring( offset, 2 ), Short, True )
+		offset += 2
+		''
+		'' check return codes 
+		'' TODO what do we do ifg an error occurs here?
+		''		throw?    	that just blows out the 'receiver' thread
+		''		callback?	seems likely 
+		''		print & go	seems most likely
+		For i = 0 To Len( packet ) - remainingLength - 1
+			Dim retCode As Integer 
+			retCode = FromBitString( packet.Substring( offset + i, 1 ), Byte, True )
+			If ( retCode And &H80 ) = &H80 Then 
+				Console.WriteLine( "SUBSCRIPTION ERROR - sub #" & CStr( i ) )
+			End If
+		Next i				
+		Return 0
+	End Function
+	#End Region
+	#Region Unsubscribe
+	Private Function EncodeUnsubscribe( topics() As String ) As String
+		Dim flags As Integer
+		Dim fixedHeader As String = ""
+		Dim packet As String = ""
+		Dim i As Integer
+		
+		flags = ( MQTT_PACKET_ID_UNSUBSCRIBE << 4 ) Or &H02		'' bit 1 MUST be set
+		''
+		'' packet identifier
+		packet = ToBitString( Rnd() * 1000, Short, True )
+		''
+		'' add all topic filters
+		For i = 0 To topics.Length - 1
+			If Not topics( i ) Is Nothing Then 
+				packet &= EncodeString( topics( i ) )
+			End If
+		Next i
+		''
+		'' build fixed header 				
+		fixedHeader = ToBitString( flags, Byte, True )
+		fixedHeader &= EncodeRemainingLength( Len( packet ) )
+		'' 
+		'' assemble and done
+		Return fixedHeader & packet
+	End Function
+	
+	Private Function DecodeUnsubAck( packet As String ) As Integer
+		Dim exc As Exception
+		Dim remainingLength As Integer
+		Dim packatIdentifier As Integer
+		Dim offset As Integer = 0
+		Dim returnCode As Integer = 0
+		
+		offset = 1
+		remainingLength = DecodeRemainingLength( packet, offset )
+		If remainingLength <> 2 Then 
+			Throw GenException( MQTT_ERR_MALFORMED_UNSUBACK, "malformed UNSUBACK - bad length" )
+		End If
+		packatIdentifier = FromBitString( packet.Substring( offset, 2 ), Short, True )		
+		Return returnCode
+	End Function
+	#End Region
+	#Region Protocol Helpers
+	''
+	'' extract packet type from fixed header
+	'' INPUT  	packet 
+	'' OUTPUT 	packet id 
+	Public Function DecodePacketType( packet As String ) As Integer 	
+		Return FromBitString( packet.Substring( 0, 1 ), Byte, True ) >> 4 
+	End Function 
+	''
+	'' encode a string per protocol 
+	''
+	'' INPUT	native string
+	'' OUTPUT	encoded string
+	Private Function EncodeString( str As String ) As String
+		Return ToBitString( Len( str ), Short, True ) & str
+	End Function 
+	''
+	'' decode a protocol encoded string
+	'' 
+	'' INPUT		string buffer
+	''				offset to beginning of encoded string 
+	'' OUTPUT		native string
+	'' SIDE EFFECT	updates offset parameter to point to the byte following the encoded string
+	Private Function DecodeString( str As String, ByRef offset As Integer ) As String
+		Dim slen As Short
+		'' get string length 
+		slen = FromBitString( str.SubString( offset, 2 ), Short, True )
+		'' update offset to byte beyond string
+		offset += slen + 2
+		'' extract string 
+		Return str.SubString( offset - slen, slen )
+	End Function
+	''
+	'' Encodes an integer into a 'variable length integer' as specifoed in MQTT-3.1.1/2.2.3
+	'	261 The Remaining Length is encoded using a variable length encoding scheme which uses a single byte for
+	'	262 values up To 127. Larger values are handled As follows. The least significant seven bits of Each Byte
+	'	263 encode the data, And the most significant bit Is used To indicate that there are following bytes In the
+	'	264 representation. Thus Each Byte encodes 128 values And a "continuation bit". The maximum number of
+	'	265 bytes In the Remaining Length field Is four.
+	'  	-- encoding variable length int
+	'	283 do
+	'	284 	encodedByte = X Mod 128
+	'	285 	X = X DIV 128
+	'	286 	// If there are more data To encode, Set the top bit of this Byte
+	'	287 	If ( X > 0 )
+	'	288 		encodedByte = encodedByte Or 128
+	'	289 	endif
+	'	290 	'output' encodedByte
+	'	291 While ( X > 0 )
+	'' notes:
+	''		the / operator does NOT do integer division 
+	''			65 / 128 == 1 because it rounds up the remainder
+	''		the \ operator is integer division 
+	''			65 \ 128 == 0 
+	''		this caused some consternation as the multiplier was 'off by one' 
+	''
+	'' INPUT:	32bit integer to encode
+	'' OUTPUT:	bit string with encoded value
+	Private Function EncodeRemainingLength( length As Integer ) As String
+		Dim encoded As Integer
+		Dim result As String
+	
+		Do
+			encoded = length Mod 128
+			length = length \ 128	'' integer divide 
+			If length > 0 Then 	
+				encoded = encoded Or 128
+			End If
+			result &= ToBitString( encoded, Byte, True )			
+		Loop While length > 0 		
+		Return result				
+	End Function 
+	''
+	'' Decodes the 'remaining length' field ( a 'variable length integer' as specifoed in MQTT-3.1.1/2.2.3)
+	'' into an integer
+	'	261 The Remaining Length is encoded using a variable length encoding scheme which uses a single byte for
+	'	262 values up To 127. Larger values are handled As follows. The least significant seven bits of Each Byte
+	'	263 encode the data, And the most significant bit Is used To indicate that there are following bytes In the
+	'	264 representation. Thus Each Byte encodes 128 values And a "continuation bit". The maximum number of
+	'	265 bytes In the Remaining Length field Is four.
+	'  	-- decoding variable length int
+	'	299 multiplier = 1
+	'	300 value = 0
+	'	301 Do
+	'	302 	encodedByte = 'next byte from stream'
+	'	303 	value += (encodedByte And 127) * multiplier
+	'	304 	multiplier *= 128
+	'	305 	If (multiplier > 128*128*128)
+	'	306 		Throw Error(Malformed Remaining Length)
+	'	307 	While ((encodedByte And 128) != 0)
+	''
+	'' INPUT:	buff - bit encoded string containing the values to decode (typically the entire packet string)
+	'' 			offset - offset to first byte of 'remaining length' integer
+	'' OUTPUT:	decoded remaining length as integer
+	'' SIDE EFFECT:		offset is updated to point to the byte following the encoded 'remaining length'
+	Private Function DecodeRemainingLength( buff As String, ByRef offset As Integer ) As Integer
+		Dim exc As Exception 
+		Dim multiplier As Integer = 1
+		Dim value As Integer = 0
+		Dim encodedByte As Byte
+		
+		Do
+			encodedByte = FromBitString( buff.Substring( offset, 1 ), Byte, True )
+			' strip hi bit if present and calc value
+			value += ( encodedByte And 127 ) * multiplier
+			If multiplier > MQTT_MAX_REMAINING_SIZE Then 
+				Throw GenException( MQTT_ERR_MALFORMED_REMAINING_LENGTH, "malformed 'remaining length'" )
+			End If 		
+			offset += 1				'' advance to next byte
+			multiplier *= 128		'' advance multiplier
+		Loop While ( ( encodedByte And &H80 ) <> 0 )
+		
+		Return value
+		
+	End Function
+	#End Region
+	#Region Socket Helpers
+	''
+	'' = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = 
+	''
+	'' SendPacket
+	'' - issues packet to server 
+	'' - updates time of last packet transmission (used to determine issuance of ping requests)
+	''
+	'' operation is wrapped in a lock to serialize socket access
+	''
+	'' INPUT:	protocol packet as string
+	'' OUTPUT:	
+	Private Sub SendPacket( packet As String )
+		Dim exc As Exception
+		Try 
+			AcquireSocketLock()
+			Try 
+				_client.Client.Send( packet )
+			Catch exc 
+				Throw GenException( MQTT_ERR_SOCKET_ERROR, exc.Message )
+			End Try 
+			_last_packet_out_time = Controller.Timer
+		Finally 
+			ReleaseSocketLock()
+		End Try		
+	End Sub 	
+
+	''
+	'' Test and TestAndSet
+	'' slight optimization on the standard TestAndSet method
+	''	- spin on the lock var until it's not locked
+	''  - then make the actual TestAndSet call
+	'' this reduces the number of expensive calls to the TestAndSet operation:
+	''	1) it's a kernel call - inherently slow
+	''	2) CPU caches have to be flushed/synced in order to get a valid read...
+	''
+	Private Sub AcquireSocketLock
+		Do 
+			While _socket_lock <> 0
+				Thread.Sleep( 0 )
+			End While
+		Loop While Thread.TestAndSet( _socket_lock, 1 ) <> 0 
+	End Sub
+	
+	Private Sub ReleaseSocketLock
+		_socket_lock = 0
+	End Sub
+	
+	Private Sub InitializeSocketLock
+		ReleaseSocketLock()
+	End Sub
+	#End Region		
+End Class

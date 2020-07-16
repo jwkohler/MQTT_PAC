@@ -1,0 +1,71 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+
+
+Public Class MqttConnectionStatus 
+	Private _status_code As Integer
+	
+	Public ReadOnly Property StatusCode As Integer
+		Get 
+			Return _status_code
+		End Get
+	End Property 
+	
+	Public ReadOnly Property Message As String 
+		Get
+			Dim errMSg As String 
+			Select StatusCode 
+				Case MQTT_CONN_ACCEPTED 
+					errMsg = "connection accepted"
+				Case MQTT_CONN_REFUSED_BAD_PROTOCOL_VERSION
+					errMsg = "bad protocol version"
+				Case MQTT_CONN_REFUSED_BAD_CLIENTID
+					errMsg = "bad client id"
+				Case MQTT_CONN_REFUSED_SERVER_UNAVAILABLE
+					errMsg = "server unavailable"
+				Case MQTT_CONN_REFUSED_BAD_CREDENTIALS
+					errMsg = "bad credentials"
+				Case MQTT_CONN_REFUSED_NOT_AUTHORIZED				
+					errMsg = "not authorized"
+				Case Else 
+					errMsg = "unknown return code"
+			End Select 
+			Return errMsg
+		End Get
+	End Property
+	
+	Public Sub New( status As Integer )
+		_status_code = status	
+	End Sub
+End Class

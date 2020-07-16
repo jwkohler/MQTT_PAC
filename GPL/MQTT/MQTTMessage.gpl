@@ -1,0 +1,282 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+Public Class MQTTMessage 
+	#Region Statics
+	'' incremented at creation of each packet 
+	'' used to assign a unique identifier to each packet
+	Private Shared _packet_sequence As Integer = 0
+	#End Region
+	#Region Fields
+	Private _topic As String = ""
+	Private _payload As String = ""
+	Private _qos As Integer = 0
+	Private _retain As Boolean = False
+	Private _duplicate As Boolean = False
+	Private _identifier As Integer = 0
+	#End Region
+	#Region Properties	
+	Public Property Topic As String
+		Get
+			Return _topic
+		End Get
+		Set ( value As String )
+			_topic = value
+		End Set
+	End Property 
+	Public Property Payload As String
+		Get
+			Return _payload
+		End Get
+		Set ( value As String )
+			_payload = value
+		End Set
+	End Property 
+	Public Property QOS As Integer
+		Get
+			Return _qos
+		End Get
+		Set ( value As Integer )
+			_qos = value
+		End Set
+	End Property 
+	Public Property Retain As Boolean
+		Get
+			Return _retain
+		End Get
+		Set ( value As Boolean )
+			_retain = value
+		End Set
+	End Property 
+	Public Property Duplicate As Boolean
+		Get
+			Return _duplicate
+		End Get
+		Set ( value As Boolean )
+			_duplicate = value
+		End Set
+	End Property 
+	Public Property Identifier As Integer
+		Get
+			Return _identifier
+		End Get
+		Set ( value As Integer )
+			_identifier = value
+		End Set
+	End Property 
+	#End Region
+	#Region Initialization
+	Public Sub New()
+	End Sub
+	Public Sub New( topic As String, payload As String, retain As Boolean )
+		_packet_sequence += 1		
+		_identifier = _packet_sequence		
+		_topic = topic
+		_payload = payload
+		_retain = retain
+		_qos = MQTT_QOS_AT_MOST_ONCE
+	End Sub	
+	Public Sub New( topic As String, payload As String, retain As Boolean, qos As Integer )
+		_packet_sequence += 1		
+		_identifier = _packet_sequence		
+		_topic = topic
+		_payload = payload
+		_retain = retain
+		_qos = qos And MQTT_QOS_MASK
+	End Sub
+	#End Region
+End Class
+
+Public Class MQTTMessageQueue
+	#Region Constants
+	'' thread event mask usedd to signal consuming thread that 
+	'' something has arrived in the queue
+	Private Const MQTT_MESSAGE_QUEUE_EVENT As Integer = &H0080
+	#End Region 
+	#Region Fields
+	Private _head As Item
+	Private _tail As Item
+	Private _size As Integer = 0
+	Private _max_size As Integer = 0
+	Private _lock As Integer
+	Private _waiter As Thread
+	Private _owner As Thread = Thread.CurrentThread
+	Private Shared _nullItem As item = Nothing
+	Private Shared _emptyString As String
+	#End Region
+	#Region Inner Classes
+	#Region Item
+	Private Class Item
+		Private _value As MQTTMessage
+		Private _prev As Item
+		Private _next As Item
+
+		Public Sub New( value As MQTTMessage )
+			_value = value
+		End Sub
+		Public Property NextItem As Item
+			Get
+				Return _next
+			End Get
+			Set(value As Item)
+				_next = value
+			End Set
+		End Property
+		Public Property PreviousItem As Item
+			Get
+				Return _prev
+			End Get
+			Set(value As Item)
+				_prev = value
+			End Set
+		End Property
+		Public ReadOnly Property Value As MQTTMessage
+			Get
+				Return _value
+			End Get
+		End Property
+	End Class
+	#End Region 
+	#End Region 
+	#Region Properties
+	Public ReadOnly Property Count As Integer
+		Get
+			Return _size
+		End Get
+	End Property
+	Public ReadOnly Property MaxCount As Integer
+		Get
+			Return _max_size
+		End Get
+	End Property
+	#End Region 
+	#Region Lock Helpers
+	Private Sub Lock
+		While Thread.TestAndSet( _lock, 1 ) <> 0 
+			Thread.Sleep( 0 )
+		End While
+	End Sub
+	Private Sub Unlock
+		_lock = 0
+	End Sub
+	#End Region 
+	#Region Initialization 
+	Public Sub New()
+		_head = Nothing
+		_tail = Nothing
+		_size = 0
+		_lock = 0
+	End Sub
+	#End Region 
+	#Region Public Interface
+	Public Sub Enqueue( value As MQTTMessage )
+		Dim item As New Item( value )
+		Lock
+		Try
+			If _head Is Nothing Then
+				_head = item
+				_tail = item
+			Else
+				item.PreviousItem = _tail
+				_tail.NextItem = item
+				_tail = item
+			End If
+			_size += 1
+			_max_size = Math.Max( _max_size, _size )
+		Finally
+			Unlock
+			If Not _waiter Is Nothing Then 
+				_waiter.SendEvent( &H80 )
+			End If
+		End Try 
+		
+	End Sub
+	'
+	' dequeue oldest item 
+	' INPUT
+	'	mask	additional event bits which will unblock the thread 
+	'			if the thread is unblocked on one of these bits, it Nothing is returned
+	'	timeout	if no items arrive before this timeout, \Nothing is returned
+	' Output
+	'	oldest queued item or Nothing
+	'   m		0 timed out
+	'          !0 contains bit mask of event(s) which unblocked the operation
+	'	
+	Public Function Dequeue( mask As Integer, timeout As Integer, ByRef outMask As Integer ) As MQTTMessage
+		Dim item As Item 
+		Dim nextItem As Item 
+		
+		outMask = 0
+		''
+		'' if the queue is empty then wait here until 
+		''	1) something is placed in the queue 
+		''	2) timeout occurs
+		''	3) thread is signalled 
+		''     supplied mask may contain event bits other than _our_ 'item in queue' event 
+		mask = mask Or MQTT_MESSAGE_QUEUE_EVENT
+		While Count <= 0 
+			_waiter = Thread.CurrentThread
+			outMask = Thread.WaitEvent( mask, timeout )
+			If ( outMask And MQTT_MESSAGE_QUEUE_EVENT ) <> MQTT_MESSAGE_QUEUE_EVENT Then 
+				Return Nothing
+			End If
+		End While
+		
+		Lock
+		item = _head
+		nextItem = _head.NextItem 
+		Try 
+			If nextItem Is Nothing Then
+				_head = Nothing
+				_tail = Nothing
+			Else
+				nextItem.PreviousItem = _nullItem
+				_head = nextItem
+			End If
+			_size -= 1
+			Return item.Value
+		Finally 
+			Unlock
+		End Try			
+	End Function
+	Public Sub DumpQueue
+		Dim item As Item
+		Console.WriteLine( "queue size:" & CStr( _size ) )
+		item = _head
+		While Not item Is Nothing 
+			Console.WriteLine( "  item: [" & item.Value.Topic & "]" )
+			item = item.NextItem
+		End While
+	End Sub
+	#End Region
+End Class

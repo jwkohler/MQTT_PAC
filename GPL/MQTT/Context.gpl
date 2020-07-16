@@ -1,0 +1,51 @@
+'Created: 7/6/2020 2:30:30 PM
+Module MQTT
+	Public Const MQTT_ERR_CONN_CLOSED As Integer = -2701
+	Public Const MQTT_ERR_NOT_CONNACK As Integer = -2702
+	Public Const MQTT_ERR_MALFORMED_REMAINING_LENGTH As Integer = -2703
+	Public Const MQTT_ERR_MALFORMED_ACK As Integer = -2704
+	Public Const MQTT_ERR_UNSUPPORTED_PACKET As Integer = -2705
+	Public Const MQTT_ERR_MALFORMED_PUBLISH As Integer = -2706
+
+		
+		
+	''
+	'' Maximum 'remaining length' value
+	Public Const MQTT_MAX_REMAINING_SIZE As Integer 		= 2097152		
+	
+	Public Const MQTT_QOS_AT_MOST_ONCE As Integer = 0
+	Public Const MQTT_QOS_AT_LEAST_ONCE As Integer = 1
+	Public Const MQTT_QOS_EXACTLY_ONCE As Integer = 2
+	
+	
+	
+	Public Const MQTT_FLAG_SESSION_PRESENT As Integer 	= &H01	
+	
+	
+	
+	Public Const MQTT_CONN_ACCEPTED  						As Integer = 0
+	Public Const MQTT_CONN_REFUSED_BAD_PROTOCOL_VERSION 	As Integer = 1
+	Public Const MQTT_CONN_REFUSED_BAD_CLIENTID 			As Integer = 2
+	Public Const MQTT_CONN_REFUSED_SERVER_UNAVAILABLE		As Integer = 3
+	Public Const MQTT_CONN_REFUSED_BAD_CREDENTIALS			As Integer = 4
+	Public Const MQTT_CONN_REFUSED_NOT_AUTHORIZED			As Integer = 5
+
+	
+		
+		
+	Public Const MQTT_PACKET_ID_CONNECT As Integer 		= &H01		
+	Public Const MQTT_PACKET_ID_CONNACK As Integer 		= &H02		
+	Public Const MQTT_PACKET_ID_PUBLISH As Integer		= &H03		
+	
+	Public Const MQTT_PACKET_ID_SUBSCRIBE As Integer	= &H08		
+	Public Const MQTT_PACKET_ID_SUBACK As Integer		= &H09		
+	Public Const MQTT_PACKET_ID_UNSUBSCRIBE As Integer	= &H0A		
+	Public Const MQTT_PACKET_ID_UNSUBACK As Integer		= &H0B
+	
+	Public Const MQTT_PACKET_ID_PINGREQ As Integer 		= &H0C		
+	Public Const MQTT_PACKET_ID_PINGRESP As Integer 	= &H0D		
+	Public Const MQTT_PACKET_ID_DISCONNECT As Integer 	= &H0E		
+	
+	
+	
+End Module

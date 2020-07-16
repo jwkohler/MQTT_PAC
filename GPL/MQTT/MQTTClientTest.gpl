@@ -1,0 +1,331 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+
+
+Class MQTTClientTest
+	Private Const EVENT_CONNECT 	As Integer = &H01
+	Private Const EVENT_DISCONNECT 	As Integer = &H02
+	Private Const EVENT_PUBLISHED 	As Integer = &H04
+	Private Const EVENT_RECEIVED 	As Integer = &H08
+	Private Const EVENT_STOP 		As Integer = &H10
+	Private Const EVENT_6 			As Integer = &H20
+	Private Const EVENT_7 			As Integer = &H40
+	Private Const EVENT_ERROR 		As Integer = &H40
+	Private Const EVENT_ALL			As Integer = &HFF
+	
+	Private _thread As Thread
+	Private mqtt_client As MqttClient
+	Private received As Integer 
+	Private verbose As Boolean = True
+	
+	Private TopicStatus As String = "/devices/PAC/connection/status"
+
+	
+	Public Sub New( serverEndpoint As IPEndPoint )
+		_thread = Thread.CurrentThread
+		mqtt_client = New MqttClient( serverEndpoint, "PAC:" & Controller.PDB( 110 )  )
+		mqtt_client.OnError = New MqttErrorDelegate( AddressOf ClientError )
+		mqtt_client.OnConnected = New MqttConnectionDelegate( AddressOf Connected )
+		mqtt_client.OnConnectFailed = New MqttConnectionDelegate( AddressOf ConnectFailed )
+		mqtt_client.OnDisconnected = New MqttConnectionDelegate( AddressOf Disconnected )
+		mqtt_client.OnPublished = New MqttMessagePublishedDelegate( AddressOf MessagePublished )
+		mqtt_client.OnMessageReceived = New MqttMessageReceivedDelegate( AddressOf MessageReceived )
+	End Sub
+		
+	''
+	'' invoked when MQTT client encounters an error
+	'' reports to console
+	'' sends event &H80 to owning thread
+	Public Sub ClientError( mqtt As MqttClient, errCode As Integer, errMsg As String )
+		If verbose Then Console.WriteLine( "** error: " & mqtt.ClientID & " code:" & CStr( errCode ) & "  " & errMsg )
+		_thread.SendEvent( EVENT_ERROR )	' terminate main thread
+	End Sub
+	
+	Public Sub Connected( mqtt As MqttClient )
+		If verbose Then Console.WriteLine( "** connected: " & mqtt.ClientID & " connected:" & CStr( mqtt.IsConnected ) & " clean:" & CStr( mqtt.CleanSession ) )
+		_thread.SendEvent( EVENT_CONNECT )
+	End Sub
+	
+	Public Sub ConnectFailed( mqtt As MqttClient )
+		If verbose Then Console.WriteLine( "** connect failed: " & mqtt.ClientID & "   retCode:" & CStr( mqtt.ConnectStatus.StatusCode ) & " " & mqtt.ConnectStatus.Message )
+	End Sub
+	
+	Public Sub Disconnected( mqtt As MqttClient )
+		If verbose Then Console.WriteLine( "** disconnected: " & mqtt.ClientID & " connected:" & CStr( mqtt.IsConnected ) )
+		_thread.SendEvent( EVENT_DISCONNECT )
+	End Sub
+	
+	Public Sub MessagePublished( msg As MQTTMessage )
+		If verbose Then Console.WriteLine( "** published '" & msg.Topic & "' (" & msg.Payload & ")" )
+		_thread.SendEvent( EVENT_PUBLISHED )
+	End Sub 
+	
+	Public Sub MessageReceived( msg As MQTTMessage )
+		received += 1
+		If verbose Then Console.WriteLine( "** received '" & msg.Topic & "' (" & msg.Payload & ")" )
+		_thread.SendEvent( EVENT_RECEIVED )
+		If msg.payload = "STOP" Then _thread.SendEvent( EVENT_STOP )
+	End Sub
+
+	''
+	'' breakable sleep 
+	'' sleeps 'duration' milliseeconds unless interrupted by a thread event &H80
+	'' when interrupted a generic exception is raised
+	Private Sub Sleep( duration As Integer )
+		If Thread.WaitEvent( EVENT_ERROR, duration ) <> 0 Then 
+			Console.WriteLine( "sleep interrupted - disconnecting - generating error"  )
+			mqtt_client.Disconnect()
+			Dim exc As New Exception 
+			exc.ErrorCode = -786
+			exc.Qualifier = 1
+			Throw exc
+		End If
+	End Sub
+	
+	Private Sub ClearEvents
+		'' clear and return all pending events - no wait
+		Thread.WaitEvent( &HFF, 0 )
+	End Sub 
+
+
+	Private Sub Connect()
+		mqtt_client.UserName = "Ralphie"
+		mqtt_client.Password = "RedRider"
+		mqtt_client.KeepAlive = 30
+		mqtt_client.LastWillTopic = TopicStatus
+		mqtt_client.LastWill = "OFFLINE"
+		mqtt_client.LastWillRetain = True
+		mqtt_client.LastWillQOS = MQTT_QOS_EXACTLY_ONCE		
+		mqtt_client.KeepAlive = 10		
+		mqtt_client.Connect()					
+	End Sub
+	
+	Private Sub Disconnect
+		mqtt_client.Disconnect()
+		
+	End Sub
+	
+	
+	Public Function TestConnect() As Boolean
+		Dim exc As Exception
+		''
+		'' ensure we're on owning thread
+		'' why doesn't "_thread is Thread.CurrentThread" work?
+		If _thread.Name <> Thread.CurrentThread.Name Then 
+			exc = New Exception
+			exc.ErrorCode = -786
+			exc.Qualifier = 12
+			Throw exc
+		End If
+			
+		ClearEvents()
+		
+		Try 
+			Connect()
+			Console.WriteLine( "== waiting connack" )
+			If Thread.WaitEvent( EVENT_CONNECT, 1000 ) = 0 Then 
+				Console.WriteLine( "== error - connect ack timedout" )
+				Return False
+			End If
+			Console.WriteLine( "== received connack" )
+			Sleep( 1000 )						
+			Disconnect()		
+			Console.WriteLine( "== waiting disconack" )
+			If Thread.WaitEvent( EVENT_DISCONNECT, 1000 ) = 0 Then 
+				Console.WriteLine( "== error - disconnect ack timedout" )
+				Return False
+			End If
+			Console.WriteLine( "== received disconnack" )
+		Catch exc 
+			Console.WriteLine( "exception:" & CStr( exc.ErrorCode ) & ":" & exc.Message )
+		End Try
+		Return True
+	End Function
+	
+	Public Function TestKeepAlive() As Boolean
+		ClearEvents()
+		Console.WriteLine( "-- test: keep alive" )
+		Console.WriteLine( "   abort this test to verify delivery of last will to " & TopicStatus )
+		Dim logLvl As Integer = mqtt_client.SetLogLevel( MQTT_LOG_LEVEL_ALL )
+		Connect()
+		SetOnline()
+		Sleep( mqtt_client.KeepAlive * 5000 )
+		SetOffline()
+		Disconnect()	
+		mqtt_client.SetLogLevel( logLvl )
+		Return True
+	End Function 
+	
+	Public Function TestPublish() As Boolean
+		ClearEvents()
+		Console.WriteLine( "-- test: test publish" )
+		Dim logLvl As Integer = mqtt_client.SetLogLevel( MQTT_LOG_LEVEL_ALL )
+		Dim i As Integer
+		Connect()
+		SetOnline()		
+		For i = 0 To 5
+			Dim loc As New Location
+			Dim payload As String
+			loc.Here
+			payload = Format( loc.X, "0.000" ) & "," &  Format( loc.Y, "0.000" ) & "," &  Format( loc.Z, "0.000" ) 				
+			mqtt_client.Publish( "/devices/PAC/current/location", payload, False, MQTT_QOS_AT_MOST_ONCE )
+			Sleep( 5 )
+		Next i
+		SetOffline()
+		Disconnect()	
+		mqtt_client.SetLogLevel( logLvl )
+		Return True
+	End Function 
+	
+	Public Function TestSubscribe() As Boolean
+		ClearEvents()
+		Console.WriteLine( "-- test: test subscribe" )
+		Dim logLvl As Integer = mqtt_client.SetLogLevel( MQTT_LOG_LEVEL_ALL )
+		Dim i As Integer
+		
+		Dim topics( 3 ) As String
+		Dim qos( 3 ) As Integer
+		
+		topics( 0 ) = "/devices/PAC/states/A"
+		topics( 1 ) = "/devices/PAC/states/B"
+		topics( 2 ) = "/devices/PAC/states/C"
+		qos( 0 ) = 0
+		qos( 1 ) = 0
+		qos( 2 ) = 0
+		
+		Connect()
+		SetOnline()		
+		mqtt_client.Subscribe( topics, qos )
+		Sleep( 1000 )
+		If Thread.WaitEvent( EVENT_RECEIVED, 30000 ) = 0 Then 
+			Console.WriteLine( "== no messages received..." )
+		End If
+		mqtt_client.Unsubscribe( topics )		
+		SetOffline()
+		Disconnect()
+		mqtt_client.SetLogLevel( logLvl )
+		Return True
+	End Function 
+	
+	Public Function TestDuration() As Boolean
+		ClearEvents()
+		Console.WriteLine( "-- test: test subscribe" )
+		Dim logLvl As Integer = mqtt_client.SetLogLevel( MQTT_LOG_LEVEL_ALL )
+		Dim i As Integer
+		
+		Dim topics( 3 ) As String
+		Dim qos( 3 ) As Integer
+		
+		topics( 0 ) = "/devices/PAC/states/A"
+		topics( 1 ) = "/devices/PAC/states/B"
+		topics( 2 ) = "/devices/PAC/states/C"
+		qos( 0 ) = 0
+		qos( 1 ) = 0
+		qos( 2 ) = 0
+		
+		Connect()
+		SetOnline()		
+		mqtt_client.Subscribe( topics, qos )
+		Sleep( 1000 )
+		While Thread.WaitEvent( EVENT_STOP, 0 ) <> EVENT_STOP 
+			Dim loc As New Location
+			Dim payload As String
+			loc.Here
+			payload = Format( loc.X, "0.000" ) & "," &  Format( loc.Y, "0.000" ) & "," &  Format( loc.Z, "0.000" ) 				
+			mqtt_client.Publish( "/devices/PAC/current/location", payload, False, MQTT_QOS_AT_MOST_ONCE )
+			mqtt_client.Publish( "/devices/PAC/status/msgs/received", CStr( received ), False, MQTT_QOS_AT_MOST_ONCE )
+			mqtt_client.Publish( "/devices/PAC/status/memory", Controller.Command( "SHOW MEMORY -all" ), False, MQTT_QOS_AT_MOST_ONCE )
+			Sleep( 500 )
+		End While
+		mqtt_client.Unsubscribe( topics )		
+		SetOffline()
+		Disconnect()
+		mqtt_client.SetLogLevel( logLvl )
+		Return True
+	End Function 
+		
+	Public Function TestBenchmarkPublish( payloadSize As Integer ) As Boolean
+		ClearEvents()
+		Console.WriteLine( "-- test: test benchmark publish" )
+		Dim logLvl As Integer = mqtt_client.SetLogLevel( MQTT_LOG_LEVEL_NONE )
+		Dim pubTopic As String = "/devices/PAC/test/benchmark/value"
+		Dim i As Integer
+		Dim a, b As Double
+		Dim iterations As Integer = 10000
+		Dim payload As String 
+		
+		For i = 0 To payloadSize - 1
+			payload &= "X"
+		Next i		
+		
+		a = Controller.Timer
+		Connect()
+		If Thread.WaitEvent( EVENT_CONNECT, 1000 ) = 0 Then 
+			Console.WriteLine( "== error - connect ack timedout" )
+			Return False
+		End If
+		b = Controller.Timer
+		Console.WriteLine( "-- connect elapsed: " & Format( b - a, "0.000000" ) )
+		SetOnline()		
+		Console.WriteLine( "-- begin benchmark - iterations: " & CStr( iterations ) )
+		verbose = False
+		a = Controller.Timer
+		For i = 0 To iterations
+			mqtt_client.Publish( pubTopic, payload, False, MQTT_QOS_AT_MOST_ONCE )
+		Next i
+		b = Controller.Timer		
+		verbose = True
+		Console.WriteLine( "-- published " & CStr( iterations ) & " messages of " & CStr( Len( payload ) ) & " bytes   elapsed:" & Format( b - a, "0.0000" ) & "  per:" & Format( ( b - a ) / iterations, "0.000000" ) )
+		SetOffline()
+		a = Controller.Timer		
+		Disconnect()
+		If Thread.WaitEvent( EVENT_DISCONNECT, 1000 ) = 0 Then 
+			Console.WriteLine( "== error - disconnect ack timedout" )
+			Return False
+		End If
+		b = Controller.Timer
+		Console.WriteLine( "-- disconnect elapsed: " & Format( b - a, "0.000000" ) )
+		mqtt_client.SetLogLevel( logLvl )		
+		Return True
+	End Function 
+	
+	
+	Private Sub SetOnline()
+		mqtt_client.Publish( TopicStatus, "ONLINE", True, MQTT_QOS_AT_MOST_ONCE )			
+	End Sub
+	Private Sub SetOffline()
+		mqtt_client.Publish( TopicStatus, "OFFLINE", True, MQTT_QOS_AT_MOST_ONCE )			
+	End Sub
+	
+End Class

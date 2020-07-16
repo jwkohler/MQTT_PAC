@@ -1,0 +1,134 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+
+Module MQTTConsts
+	Public Const MQTT_CLIENT_VERSION					As String = "0.1.0"
+	''
+	'' Exception/Errors
+	'' GPL docs state that we users are allowed exception codes in the range -2000 to -2999
+	'' MQTT exceptions are all -2805 (completely arbitrary - change as needed)
+	'' The Exception.Qualifier property is set to the actual 'error code'
+	''	
+	'' Exception ID
+	Public Const MQTT_EXCEPTION_CODE					As Integer = -2805
+	'' Error Codes 
+	'' - carried In Exception.Qualifier 
+	'' - passed to OnError event handler
+	Public Const MQTT_ERR_NO_ERROR						As Integer = 0
+	Public Const MQTT_ERR_CONN_REFUSED					As Integer = 1
+	Public Const MQTT_ERR_CONN_CLOSED					As Integer = 2
+	Public Const MQTT_ERR_MALFORMED_CONNACK				As Integer = 3
+	Public Const MQTT_ERR_MALFORMED_PUBLISH 			As Integer = 4	
+	Public Const MQTT_ERR_MALFORMED_REMAINING_LENGTH 	As Integer = 5
+	Public Const MQTT_ERR_UNSUPPORTED_PACKET			As Integer = 6	
+	Public Const MQTT_ERR_MALFORMED_UNSUBACK			As Integer = 7	
+	Public Const MQTT_ERR_SOCKET_ERROR					As Integer = 8
+	Public Const MQTT_ERR_SERVER_CLOSED_CONNECTION		As Integer = 9
+	Public Const MQTT_ERR_SERVER_LOST					As Integer = 10	
+	Public Const MQTT_ERR_UNSUPPORTED_QOS				As Integer = 11
+	Public Const MQTT_ERR_UNKNOWN_ERROR					As Integer = 12
+	Public Const MQTT_ERR_MAX_CODE						As Integer = 12
+	''
+	'' Array of strings providing error code explanations
+	Public Dim MQTTErrors( MQTT_ERR_MAX_CODE ) As String
+	''
+	'' QOS values
+	Public Const MQTT_QOS_AT_MOST_ONCE 					As Integer = 0
+	Public Const MQTT_QOS_AT_LEAST_ONCE 				As Integer = 1
+	Public Const MQTT_QOS_EXACTLY_ONCE 					As Integer = 2
+	Public Const MQTT_QOS_MASK 							As Integer = &H03
+	''
+	'' min.max keep alive periods (seconds)
+	Public Const MQTT_KEEPALIVE_MIN As Integer = 5
+	Public Const MQTT_KEEPALIVE_MAX As Integer = 7200
+
+	''
+	'' Maximum 'remaining length' value
+	'' 2097152 is the protocol maximum - what's "practical" for a GPL platform?
+	'' defaults to 10k
+	Public Const MQTT_MAX_REMAINING_SIZE 				As Integer = ( 1024 * 10 )
+	'' 
+	'' Socket Receive Buffer size - (max packet size)
+	Public Const MQTT_RECEIVE_BUFF_SIZE					As Integer = ( 1024 * 4 )
+	''
+	'' Fixed Header Flags
+	Public Const MQTT_FLAG_REQ_CLEAN_SESSION 			As Integer = &H02		'' connect
+	Public Const MQTT_FLAG_LASTWILL_PRESENT 			As Integer = &H04		'' connect
+	Public Const MQTT_FLAG_LASTWILL_RETAIN 				As Integer = &H20		'' connect
+	Public Const MQTT_FLAG_USERNAME_PRESENT 			As Integer = &H80		'' connect
+	Public Const MQTT_FLAG_PASSWORD_PRESENT 			As Integer = &H40		'' connect
+	Public Const MQTT_FLAG_SESSION_PRESENT 				As Integer = &H01		'' connack
+	''
+	'' Protocol Control Packet Types
+	Public Const MQTT_PACKET_ID_CONNECT 				As Integer = &H01		'' supported		
+	Public Const MQTT_PACKET_ID_CONNACK 				As Integer = &H02		'' supported
+	Public Const MQTT_PACKET_ID_PUBLISH 				As Integer = &H03		'' supported	
+	Public Const MQTT_PACKET_ID_PUBACK 					As Integer = &H04		'' QOS 1 
+	Public Const MQTT_PACKET_ID_PUBREC 					As Integer = &H05		'' QOS 1 
+	Public Const MQTT_PACKET_ID_PUBREL 					As Integer = &H06		'' QOS 2 
+	Public Const MQTT_PACKET_ID_PUBCOMP 				As Integer = &H07		'' QOS 2 	
+	Public Const MQTT_PACKET_ID_SUBSCRIBE 				As Integer = &H08		'' supported
+	Public Const MQTT_PACKET_ID_SUBACK 					As Integer = &H09		'' supported
+	Public Const MQTT_PACKET_ID_UNSUBSCRIBE 			As Integer = &H0A		'' supported
+	Public Const MQTT_PACKET_ID_UNSUBACK 				As Integer = &H0B		'' supported
+	Public Const MQTT_PACKET_ID_PINGREQ 				As Integer = &H0C		'' supported
+	Public Const MQTT_PACKET_ID_PINGRESP 				As Integer = &H0D		'' supported
+	Public Const MQTT_PACKET_ID_DISCONNECT 				As Integer = &H0E		'' supported		
+	''
+	'' CONNECT return codes
+	'' When the server returns a CONNACK, it contains one of these return codes
+	Public Const MQTT_CONN_ACCEPTED  						As Integer = 0
+	Public Const MQTT_CONN_REFUSED_BAD_PROTOCOL_VERSION 	As Integer = 1
+	Public Const MQTT_CONN_REFUSED_BAD_CLIENTID 			As Integer = 2
+	Public Const MQTT_CONN_REFUSED_SERVER_UNAVAILABLE		As Integer = 3
+	Public Const MQTT_CONN_REFUSED_BAD_CREDENTIALS			As Integer = 4
+	Public Const MQTT_CONN_REFUSED_NOT_AUTHORIZED			As Integer = 5
+				
+	Public Sub Init
+		MQTTErrors( MQTT_ERR_NO_ERROR ) 					= "-no error-"
+		MQTTErrors( MQTT_ERR_CONN_REFUSED ) 				= "broker refused connect (socket not listening)"
+		MQTTErrors( MQTT_ERR_CONN_CLOSED ) 					= "socket closed"
+		MQTTErrors( MQTT_ERR_MALFORMED_CONNACK ) 			= "malformed SOCKACK" 
+		MQTTErrors( MQTT_ERR_MALFORMED_PUBLISH ) 			= "malformed PUBLISH"
+		MQTTErrors( MQTT_ERR_MALFORMED_REMAINING_LENGTH )	= "malformed remaining length"
+		MQTTErrors( MQTT_ERR_UNSUPPORTED_PACKET ) 			= "unsupported protocol packet" 
+		MQTTErrors( MQTT_ERR_MALFORMED_UNSUBACK ) 			= "malformed UNSUBACK"
+		MQTTErrors( MQTT_ERR_SOCKET_ERROR ) 				= "socket error"
+		MQTTErrors( MQTT_ERR_SERVER_CLOSED_CONNECTION ) 	= "server closed connection"
+		MQTTErrors( MQTT_ERR_SERVER_LOST ) 					= "server lost (keepalive timedout)"
+		MQTTErrors( MQTT_ERR_UNSUPPORTED_QOS ) 				= "unsupported QOS"	
+		MQTTErrors( MQTT_ERR_UNKNOWN_ERROR )				= "unknown error"
+	End Sub
+			
+End Module

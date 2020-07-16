@@ -1,0 +1,242 @@
+' ----------------------------------------------------------------------------
+' Overview
+'
+' MQTTClient implements MQTT 3.1.1 in GPL
+'
+' The client provides the following methods:
+'	Connect			connect to broker
+' 	Disconnect		clean disconnect from broker
+'	Publish			publish a messages to a topic
+'	Subscribe		subscribe to a number of topics
+'	Unsubscribe		unsubscribe from selected topics
+'
+' A set of 'events' is provided.  These are implemented as Delegates which 
+' allow a user of the client to receive asynchronous notification of various 
+' events/state changes.
+' 	OnEror			invoked when a socket/protocol error is detected
+' 	OnConnected		invoked when the client/broker complete a successful 
+'					connection handshake
+'	OnConnectFailed	invoked when the broker refuses to connect (assuming 
+'					successful Socket connection).  Reasons may be authorization,
+'					bad client id, etc.
+'	
+'	OnDisconnected	invoked when a clean disconnect from the broker is completed
+'	OnPublished		invoked when a message is successfully published
+'	OnMessageReceived	invoked when a messages is received from a subscribed topic
+'
+' Received messages are wrapped in an MqttMessage object.  This object contains
+' information about the received message:
+'	Topic			topic to which the message was published
+'	Payload			message content
+'	QOS				delivery QOS
+'	Retain			message retain flag (True if retained)
+'	Duplicate		duplicate flag (True if duplicate)
+' 	Identifier		message identifier
+'
+' The Topic and Payload properties are of interest to the application.  The rest 
+' of the properties are typically of no interest to the application as they represent
+' protocol level details.
+'
+' - The MQTT client imposes no plicy on the content of messages flowing to/from 
+'   the broker.  The Payload property is a String representing the binary content 
+'   of the message received.
+'
+' - Each message received results in the generation of a MqttMessage object.  The 
+'   MQTT library retains no references to these objects.
+'
+' ----------------------------------------------------------------------------
+'
+'  MQTT 3.1.1 Client Implementation
+'
+'  Control Packet		Implemented
+'	CONNECT					Yes
+'	CONNACK					Yes
+'	DISCONNECT				Yes
+'	PUBLISH QoS0			Yes			
+'	PUBLISH QoS1			No
+'	PUBLISH QoS2			No
+'	PUBACK					Yes
+'	PUBREC					No		(QoS1)
+'  	PUBREL					No		(QoS2)
+'	PUBCOMP					No		(QoS2)
+'	SUBSCRIBE				Yes
+'	SUBACK					Yes
+'	UNSUBSCRIBE				Yes
+'	UNSUBACK				Yes
+'	PINGREQ					Yes
+'	PINGRESP				Yes
+'    
+' ----------------------------------------------------------------------------
+' Implementation Details
+'
+' Two threads are consumed in the implementation of the protocol.
+'   Receiver
+'     Receives packets from the broker.  This thread is idle until data 
+'     arrives from the broker.
+'     Upon receipot of a message, this thread then decodes the packet as appropriate
+'     for the message, possibly invoking an event (e.g. message received).
+'   KeepAlive
+'     Handles the keep alive duties by sending PINREQ packets to the broker when 
+'     the connection has been idle for some period.
+'     Note that the broker WILL close the connection if the KeepAlive period expires
+'     without receiving any packets from the client...
+'
+' ----------------------------------------------------------------------------
+' Error Handling
+'
+' MQTT Client will throw exceptions for socket and protocol errors when executing 
+' on the main thread (i.e. the thread on which Connect/Publish/Subscribe are called)
+' These exceptions are standard GPL exceptions with these properties:
+'	ErrorCode = MQTT_EXCEPTION_CODE		default is -2805 (changeable in MQTTConsts)
+'   Qualifier = <error code>			any of MQTT_ERR_XXXX constants
+'
+' Errors encountered on a worjer thread will be reported via the OnError event.
+'
+' Remarks:
+' If MQTT Client raises and exception OR invokes the OnError, consider the 
+' client to be unstable - continuing to use the client after an error is 
+' likely to cause catastrophic failure of the software 
+'                    CONTROLLING A ROBOT
+' Always err on the side of safety.
+'
+' One should _ALWAYS_ use the LastWill capabilities of MQTT.  Combining this with 
+' a short KeepAlive period (like 5,10 seconds) and a Retained message will signal 
+' failure of this client to the rest of the cell relatively quickly.
+' ----------------------------------------------------------------------------
+' Example Usage:
+'
+' ---- Create MQTT client:
+'
+'	Dim serverEndpoint As New IPEndPoint( "192.168.0.1", 1883 )		
+'	Dim mqtt_client As MqttClient
+'	''
+'	'' create client object using the Controller's ID as ClientID
+'	mqtt_client = New MqttClient( serverEndpoint, "PAC:" & Controller.PDB( 110 )  )
+'	''
+'	'' hook up event handlers
+'	mqtt_client.OnError = New MqttErrorDelegate( AddressOf ClientError )
+'	mqtt_client.OnConnected = New MqttConnectionDelegate( AddressOf Connected )
+'	mqtt_client.OnConnectFailed = New MqttConnectionDelegate( AddressOf ConnectFailed )
+'	mqtt_client.OnDisconnected = New MqttConnectionDelegate( AddressOf Disconnected )
+'	mqtt_client.OnPublished = New MqttMessagePublishedDelegate( AddressOf MessagePublished )
+'	mqtt_client.OnMessageReceived = New MqttMessageReceivedDelegate( AddressOf MessageReceived )
+'	
+'' ---- Connect to broker
+'
+'	'' credentials
+'	mqtt_client.UserName = "Ralphie"
+'	mqtt_client.Password = "RedRider"
+'	'' keep alive period - seconds
+'	mqtt_client.KeepAlive = 60
+'	'' Last Will 
+'	mqtt_client.LastWillTopic = TopicStatus
+'	mqtt_client.LastWill = "OFFLINE"
+'	mqtt_client.LastWillRetain = True
+'	mqtt_client.LastWillQOS = MQTT_QOS_EXACTLY_ONCE		
+'	'' connect 
+'	'' when CONNACK is received, the OnConnected event is raised
+'	mqtt_client.Connect()					
+'	
+' ---- Waiting For CONNACK
+'
+'	'' 
+'	Private Const EVENT_CONNECT 	As Integer = &H40
+'	'' OnConnected event handler
+'	Public Sub Connected( mqtt As MqttClient )
+'		_thread.SendEvent( EVENT_CONNECT )
+'	End Sub
+'	
+'	Public Function Connect()As Boolean
+'		_thread = Thread.CurrentThread
+'		mqtt_client.Connect()					
+'		If Thread.WaitEvent( EVENT_CONNECT, 1000 ) = 0 Then Return False
+'		Return True
+'	End Sub
+'	
+'
+' ----------------------------------------------------------------------------
+'
+'    ---- BENCHMARKS
+'    
+'     7/10/2020 JK
+'    
+'    MQTT Server
+'    	- Win10 Pro
+'    	- 16GB RAM
+'    	- i703770 @ 3.4GHz
+'    	- Mosquitto 1.6.10 
+'    		- service
+'    		- no logging
+'    PAC
+'    	- Model		G3400  	
+'    			CPU 3.6B, FPGA 2.21 03-22-2010, MCIM 104.0, PWR 0
+'    	- GPL
+'    			GPL 4.0J2, Jun 30 2015, Release
+'    			
+'    Setup
+'    	- no other clients connected To broker
+'    	- 3 network switches between PAC And server 
+'    	
+'  	
+'  -------- Publish 
+'  
+'  Summary
+'  	published messages: 		10,000
+'  	
+'  	Payload Size (b)		Timer per publish (secs)
+'  		10						0.0010 
+'  		100						0.0019
+'  		1000					0.0072
+'  		5000					0.0298
+'  
+'  I attribute the sharp increase In time between the 1k And 5k payloads 
+'  to GPL's String handling performance.
+'
+'  CPU profiling shows the benchmark task consuming roughly 25% of the 
+'  available CPU time.  Considering the benchmark is a ticht loop with no 
+'  delays other than transmitting on a socket, this seems reasonable.
+'  
+'  =============================================
+'  -- test: test benchmark publish
+'  ** connected: PAC:0014FF-02300168 connected:-1 clean:-1
+'  -- connect elapsed: 0.011500
+'  ** published '/devices/PAC/connection/status' (ONLINE)
+'  -- begin benchmark - iterations: 10000
+'  -- published 10000 messages of 10 bytes   elapsed:10.1909  per:0.001019
+'  ** published '/devices/PAC/connection/status' (OFFLINE)
+'  ** disconnected: PAC:0014FF-02300168 connected:0
+'  ** Error: PAC:0014FF-02300168 code:1  server closed connection
+'  -- disconnect elapsed: 0.006000
+'  =============================================
+'  -- test: test benchmark publish
+'  ** connected: PAC:0014FF-02300168 connected:-1 clean:-1
+'  -- connect elapsed: 0.005875
+'  ** published '/devices/PAC/connection/status' (ONLINE)
+'  -- begin benchmark - iterations: 10000
+'  -- published 10000 messages of 100 bytes   elapsed:19.3594  per:0.001936
+'  ** published '/devices/PAC/connection/status' (OFFLINE)
+'  ** disconnected: PAC:0014FF-02300168 connected:0
+'  ** Error: PAC:0014FF-02300168 code:1  server closed connection
+'  -- disconnect elapsed: 0.005875
+'  =============================================
+'  -- test: test benchmark publish
+'  ** connected: PAC:0014FF-02300168 connected:-1 clean:-1
+'  -- connect elapsed: 0.107000
+'  ** published '/devices/PAC/connection/status' (ONLINE)
+'  -- begin benchmark - iterations: 10000
+'  -- published 10000 messages of 1000 bytes   elapsed:72.3856  per:0.007239
+'  ** published '/devices/PAC/connection/status' (OFFLINE)
+'  ** disconnected: PAC:0014FF-02300168 connected:0
+'  ** Error: PAC:0014FF-02300168 code:1  server closed connection
+'  -- disconnect elapsed: 0.005875
+'  =============================================
+'  -- test: test benchmark publish
+'  ** connected: PAC:0014FF-02300168 connected:-1 clean:-1
+'  -- connect elapsed: 0.006125
+'  ** published '/devices/PAC/connection/status' (ONLINE)
+'  -- begin benchmark - iterations: 10000
+'  -- published 10000 messages of 5000 bytes   elapsed:298.3294  per:0.029833
+'  ** published '/devices/PAC/connection/status' (OFFLINE)
+'  ** disconnected: PAC:0014FF-02300168 connected:0
+'  ** Error: PAC:0014FF-02300168 code:1  server closed connection
+'  -- disconnect elapsed: 0.006000

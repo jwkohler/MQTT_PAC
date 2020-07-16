@@ -1,0 +1,305 @@
+'' *****************************************************************************
+''  Module DESCRIPTION:
+''  	MQTT 3.1.1 Implementation for Precise Automation GPL platform
+'' 
+'' *****************************************************************************
+''  Copyright (c) 2020 John W. Kohler <jkohler@jkohler.org>
+''  All rights reserved.
+'' 
+''  Redistribution and use in source and binary forms, with or without
+''  modification, are permitted provided that the following conditions
+''  are met:
+''  1. Redistributions of source code must retain the above copyright
+''     notice, this list of conditions And the following disclaimer.
+''  2. Redistributions in binary form must reproduce the above copyright
+''     notice, this list of conditions and the following disclaimer in the
+''     documentation and/or other materials provided with the distribution.
+''  3. All advertising materials mentioning features or use of this software
+''     must display the following acknowledgement:
+''       This product includes software developed by John Kohler.
+''  4. The name of John Kohler may not be used to endorse or promote products
+''     derived from this software without specific prior written permission.
+'' 
+''  THIS SOFTWARE Is PROVIDED BY THE AUTHOR ``As Is'' AND ANY EXPRESS OR
+''  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+''  OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+''  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+''  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+''  NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+''  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+''  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+''  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+''  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+'' *****************************************************************************
+
+Module MQTTExample	
+	Const BrokerAddress		As String = "10.0.2.6"
+	Const BrokerPort 		As Integer = 31883
+	Const BrokerUser 		As String = "Ralphie"
+	Const BrokerPassword 	As String = "RedRider" 
+	''
+	'' online/offline status 
+	Private Const STATUS_TOPIC		As String = "/devices/PAC/connection/status"
+	Private Const STATUS_ONLINE 	As String = "ONLINE"
+	Private Const STATUS_OFFLINE 	As String = "OFFLINE"
+	''
+	'' thread event masks
+	'' event handlers set various masks indicating event ocurred
+	Private Const EVENT_CONNECT 	As Integer = &H01
+	Private Const EVENT_DISCONNECT 	As Integer = &H02
+	Private Const EVENT_PUBLISHED 	As Integer = &H04
+	Private Const EVENT_RECEIVED 	As Integer = &H08
+	Private Const EVENT_STOP 		As Integer = &H10
+	Private Const EVENT_ERROR 		As Integer = &H40
+	Private Const EVENT_ALL			As Integer = &HFF
+	''
+	'' QOS for all publishes	
+	'' MQTT library only supports AT MOST ONCE 
+	Private Const QOS				As Integer = MQTT_QOS_AT_MOST_ONCE
+	''
+	'' local vars
+	Private mqtt 			As MqttClient
+	Private _main_thread 	As Thread			'' primary thread - mqtt events post events to this thread
+	Private _received 		As Integer = 0		'' messages received - by event
+	Private _published 		As Integer = 0		'' messages published - by event
+	Private _verbose 		As Boolean = False	'' verbosity
+
+	''
+	'' interruptable delay 
+	'' returns true if delay ran to completion, false if interrupted
+	Public Function Delay( duration As Integer ) As Boolean
+		Return Thread.WaitEvent( EVENT_STOP Or EVENT_ERROR, duration ) = 0 
+	End Function 
+
+    Public Sub MAIN
+		Dim exc As Exception
+		Dim serverEndpoint As IPEndPoint		
+		Dim update_period As Integer = 100 	'' update in msecs
+		Dim counter As Integer
+		Dim a,b As Double					'' timer values
+		Dim i As Integer
+		Dim loc As New Location
+		Dim sub_topics( 3 ) As String		'' subscribed topics
+		Dim sub_qos( 3 ) As Integer			'' and QOS
+		
+		_main_thread  = Thread.CurrentThread
+		serverEndPoint = New IPEndPoint( BrokerAddress, BrokerPort )
+		''
+		'' init subscriptions
+		sub_topics( 0 ) = "/devices/PAC/states/A"
+		sub_topics( 1 ) = "/devices/PAC/states/B"
+		sub_topics( 2 ) = "/devices/PAC/control/loglevel"
+		sub_qos( 0 ) = 0
+		sub_qos( 1 ) = 0
+		sub_qos( 2 ) = 0
+		''
+		'' setup MQTT client
+		mqtt = New MqttClient( serverEndpoint, "PAC:" & Controller.PDB( 110 )  )
+		mqtt.UserName 			= BrokerUser
+		mqtt.Password 			= BrokerPassword
+		mqtt.LogLevel 			= MQTT_LOG_LEVEL_INFO 	'' INFO is default
+		mqtt.OnError 			= New MqttErrorDelegate( AddressOf ClientError )
+		mqtt.OnConnected 		= New MqttConnectionDelegate( AddressOf Connected )
+		mqtt.OnConnectFailed 	= New MqttConnectionDelegate( AddressOf ConnectFailed )
+		mqtt.OnDisconnected		= New MqttConnectionDelegate( AddressOf Disconnected )
+		mqtt.OnPublished 		= New MqttMessagePublishedDelegate( AddressOf MessagePublished )
+		mqtt.OnMessageReceived 	= New MqttMessageReceivedDelegate( AddressOf MessageReceived )
+		
+		''
+		'' KeepALive should be pretty short if we want the LastWill message delivered in a 
+		'' "timely" manner.  If we're relying on the LW to inform the rest of the cell that the 
+		'' robot's down (lost comms) then we want this message delivered quickly - and everything
+		'' else needs to be designed to allow for this amount of timeout.
+		'' manually timed:  Mosquitto broker delivers LW message after disconnect:
+		''      KeepAlive 		LW delivered
+		''			 5				 7		
+		''			10				15		
+		''			15				22		
+		''			20				30		
+		''			30				45		
+		''			60				90		
+		'' Mosquitto uses factor of 1.5 before raising an error
+		''
+		mqtt.KeepAlive = 5
+		''
+		'' LastWill message is online status - if we lose the connection for any reason 
+		'' the broker will set our status to OFFLINE
+		mqtt.LastWillTopic = STATUS_TOPIC
+		mqtt.LastWill = STATUS_OFFLINE
+		mqtt.LastWillRetain = True
+		mqtt.LastWillQOS = MQTT_QOS_EXACTLY_ONCE	
+		
+		Try
+			''
+			'' connect to broker
+			'' this returns after successfully opening the socket and issuing the CONNECT
+			'' control packet.  On return the broker has not yet respnded with a CONNACK.
+			'' The event handler OnConnected is invoked when the CONNACK arrives.  The handler
+			'' sends the EVENT_CONNECT event
+			'' note: we do NOT have to wait for the CONNACK but it's a good idea
+			mqtt.Connect()							
+			''
+			'' wait for the CONNACK or abort
+			If Thread.WaitEvent( EVENT_CONNECT, 1000 ) = 0 Then 
+				Console.WriteLine( "-- timeout waiting for CONNACK" )
+				Console.WriteLine( "-- terminated" )
+				Return
+			End If
+			''
+			'' we're online - update status
+			'' note this is a sync publish - on return the message has been put on the wire and 
+			''      presumably the TCP protocol has ensured its delivery to the broker
+			SetOnlineStatus( mqtt, True )			
+			''
+			'' subscribe our topics
+			mqtt.Subscribe( sub_topics, sub_qos )
+			''
+			'' cancellable delay - long enough to exercise the keep alive logic a few times
+			If Not Delay( ( mqtt.KeepAlive * 5 ) * 1000 ) Then 
+				Console.WriteLine( "-- main:delay cancelled - disconnecting, terminating" )
+				_verbose = True
+				mqtt.Disconnect()
+				Return 
+			End If
+			''
+			'' publish messages until command to stop or an error occurs
+			'' EVENT_STOP is set by receipt of magic message 
+			'' EVENT_ERROR is set by OnError handler
+			While Thread.WaitEvent( EVENT_STOP Or EVENT_ERROR, 0 ) = 0
+				counter += 1
+				loc.Here
+				a = Controller.Timer
+				mqtt.PublishAsync( "/devices/PAC/test/iterations", 			CStr( counter ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/current/location", 		FormatLocation( loc ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/status/msgs/received", 	CStr( _received ), False, QOS )
+				mqtt.PublishAsync( "/devices/PAC/status/msgs/published", 	CStr( _published ), False, QOS )
+				mqtt.PublishAsync( "/devices/PAC/status/cpu-temperature", 	Controller.PDB( 126 ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/status/time", 				Controller.PDB( 121 ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/status/uptime", 			Controller.PDB( 120 ), False, QOS )						
+				mqtt.PublishAsync( "/devices/PAC/status/homed", 			Controller.PDB( 2800 ), False, QOS )					
+				mqtt.PublishAsync( "/devices/PAC/status/estop", 			CStr( Controller.PowerState( 1 ) = 15 ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/estop-soft", 		CStr( Controller.SoftEStop ), False, QOS )					
+				mqtt.PublishAsync( "/devices/PAC/status/power/state", 		CStr( Controller.PowerEnabled ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/power/mode0", 		CStr( Controller.PowerState( 0 ) ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/power/mode1", 		CStr( Controller.PowerState( 1 ) ), False, QOS )					
+				mqtt.PublishAsync( "/devices/PAC/status/power/rawDCbus", 	Controller.PDB( 12684 ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/amp/temperature", 	Controller.PDB( 12605 ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/amp/duty", 			Controller.PDB( 12608 ), False, QOS )		
+				mqtt.PublishAsync( "/devices/PAC/status/memory", 			Controller.Command( "SHOW MEMORY" ), False, QOS )
+				b = Controller.Timer				
+				mqtt.PublishAsync( "/devices/PAC/test/elapsed-per-publish", Format( ( b - a ) / 17.0, "0.000000" ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/test/total-elapsed", 		Format( b - a, "0.000000" ), False, QOS )			
+				mqtt.PublishAsync( "/devices/PAC/test/max-queue", 			CStr( mqtt.PublishQueueMaxCount ), False, QOS )			
+
+				Thread.Sleep( update_period )
+				
+				If ( mqtt.MessagesPublished Mod 1000 ) = 0 Then 
+					Console.WriteLine( "published: " & CStr( mqtt.MessagesPublished  ) )
+				End If
+				If ( mqtt.MessagesReceived Mod 1000 ) = 0 Then 
+					Console.WriteLine( "received : " & CStr( mqtt.MessagesReceived  ) )
+				End If
+				
+			End While
+			If mqtt.ErrorCode = 0 Then 
+				'' no error - connection's good - update status
+				Console.WriteLine( "-- updating status - offline" )
+				SetOnlineStatus( mqtt, False )
+			Else 
+				'' got async error - assume client is broken
+				Console.WriteLine( "== async error occurred:" & CStr( mqtt.errorCode ) & ":" & MQTTErrors( mqtt.ErrorCode ) )
+			End If
+			Console.WriteLine( "-- begin disconnect" )
+			mqtt.Disconnect()
+			Console.WriteLine( "-- completed disconnect" )
+		Catch exc
+			'' all MQTT exceptions have an ErrorCode of MQTT_EXCEPTION_CODE with Qualifier giving the error code
+			mqtt.Disconnect()
+			If exc.ErrorCode = MQTT_EXCEPTION_CODE Then 
+				Console.WriteLine( "MQTT exception:" & CStr( exc.Qualifier ) & ":" & MQTTErrors( exc.Qualifier ) )
+			Else 
+				Console.WriteLine( "unexpected exception:" & exc.Message )
+			End If
+			Console.WriteLine( "-- terminated by error" )
+		End Try 		
+		''
+		'' a normal disconnect issues a control packet to the broker - if we terminate too quickly 
+		'' the socket'll be closed before it's fully transmitted
+		Thread.WaitEvent( EVENT_ALL, 500 )
+		Thread.Sleep( 250 )	'' allow disconnect time to happen
+		Console.WriteLine( "-- terminated by command" )
+    End Sub 
+	
+	
+	'' OnError handler
+	Public Sub ClientError( mqtt As MqttClient, errCode As Integer, errMsg As String )
+		Console.WriteLine( "** OnError: " & mqtt.ClientID & " code:" & CStr( errCode ) & "  " & errMsg )
+		_main_thread.SendEvent( EVENT_ERROR )	' terminate main thread
+	End Sub
+	'' OnConnected handler
+	'' indicates the broker has accepted the connection and is fully ready 
+	Public Sub Connected( mqtt As MqttClient )
+		If _verbose Then Console.WriteLine( "** OnConnected: " & mqtt.ClientID & " connected:" & CStr( mqtt.IsConnected ) & " clean:" & CStr( mqtt.CleanSession ) )
+		_main_thread.SendEvent( EVENT_CONNECT )
+	End Sub
+	'' OnConnectFailed
+	'' the socket connection succeeded but the server has rejected us for some reason
+	Public Sub ConnectFailed( mqtt As MqttClient )
+		Console.WriteLine( "** OnConnectFailed: " & mqtt.ClientID & "   retCode:" & CStr( mqtt.ConnectStatus.StatusCode ) & " " & mqtt.ConnectStatus.Message )
+		_main_thread.SendEvent( EVENT_ERROR )
+	End Sub
+	'' OnDisconnected handler
+	'' Disconnect succeeded
+	Public Sub Disconnected( mqtt As MqttClient )
+		Console.WriteLine( "** OnDisconnected: " & mqtt.ClientID & " connected:" & CStr( mqtt.IsConnected ) )
+		_main_thread.SendEvent( EVENT_DISCONNECT )
+	End Sub
+	'' OnMessagePublished handler
+	'' message has successfully been transmitted
+	Public Sub MessagePublished( msg As MQTTMessage )
+		If _verbose Then Console.WriteLine( "** OnPublished '" & msg.Topic & "' (" & msg.Payload & ")" )
+		_published += 1
+		_main_thread.SendEvent( EVENT_PUBLISHED )
+	End Sub 
+	'' OnMessageReceived handler
+	'' An async message has arrived from a subscribed topics
+	Public Sub MessageReceived( msg As MQTTMessage )
+		_received += 1
+		If _verbose Then Console.WriteLine( "** OnReceived '" & msg.Topic & "' (" & msg.Payload & ")" )
+		_main_thread.SendEvent( EVENT_RECEIVED )
+		If msg.payload = "STOP" Then 
+			_main_thread.SendEvent( EVENT_STOP )
+			Return
+		End If		
+		If msg.Topic = "/devices/PAC/control/loglevel" Then 
+			'' CInt returns 0 if string is not a valid integer
+			Dim lvl As Integer = CInt( msg.Payload )			
+			If lvl > MQTT_LOG_LEVEL_NONE Then 			
+				mqtt.LogLevel = lvl
+				Console.WriteLine( "-- log level set to:" & CStr( mqtt.LogLevel ) )
+			Else 
+				Console.WriteLine( "-- invalid log level: " & msg.Payload )
+			End If 
+		End If
+	End Sub
+
+	''
+	'' sets online status topic to ONLINE/OFFLINE
+	'' note: uses sync publish so we know on return the message _has been published_
+	Private Sub SetOnlineStatus( client As MqttClient, state As Boolean )
+		Dim status As String 		
+		If state Then 
+			status = STATUS_ONLINE
+		Else 
+			status = STATUS_OFFLINE
+		End If
+		client.Publish( STATUS_TOPIC, status, True, QOS )			
+	End Sub
+	
+	''
+	'' Format a Location object
+	Private Function FormatLocation( loc As Location ) As String
+		Return Format( loc.X, "0.000" ) & "," &  Format( loc.Y, "0.000" ) & "," &  Format( loc.Z, "0.000" ) 				
+	End Function
+	
+End Module
